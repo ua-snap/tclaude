@@ -335,8 +335,9 @@ sandbox() {
   local -a args=(--ro-bind / / --dev /dev --proc /proc --tmpfs /tmp --unshare-pid --die-with-parent
                  ${mask[@]+"${mask[@]}"})
   for path in "${writable[@]}" "${claude_dirs[@]}"; do args+=(--bind "$path" "$path"); done
-  # Claude's user settings and instructions stay read-only, so it can't loosen its own rules
-  for path in "$config/settings.json" "$config/CLAUDE.md"; do
+  # Claude's user settings and instructions stay read-only, so it can't loosen its own rules.
+  # Use the real path, like the binds above: bwrap can't mount through a symlink like /home -> /import/home
+  for path in "${claude_dirs[0]}/settings.json" "${claude_dirs[0]}/CLAUDE.md"; do
     if [ -f "$path" ]; then args+=(--ro-bind "$path" "$path"); fi
   done
   # Protected directories go on top, so a writable parent can't expose them
