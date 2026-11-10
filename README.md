@@ -10,9 +10,15 @@ Claude can write only to the repo and the directories you list. Slurm jobs it su
 - `/import/SNAP` is always read-only, whatever you list
 - 68-check test script
 
-<img src="docs/terminal.svg" width="1000" alt="Running tclaude in ~/my-project with TCLAUDE_WRITE_DIRS set: tclaude lists the four writable directories, Claude Code starts, and a blue 'tclaude sandbox' badge under Claude's text box lists the directories Claude can write. The tmux bar shows session tclaude_my-project with a blue tab for window 0:tclaude and an amber tab for window 1:chinook_terminal.">
+<img src="docs/terminal.svg" width="1000" alt="Running tclaude in ~/my-project with TCLAUDE_WRITE_DIRS set: tclaude lists the four writable directories, Claude Code starts, and a blue 'tclaude sandbox' badge under Claude's text box lists the directories Claude can write, with a hint below it on adding a directory. The tmux bar shows session tclaude_my-project with a blue tab for window 0:tclaude and an amber tab for window 1:chinook_terminal.">
 
 Everything else on the filesystem is read-only to Claude. The `writable:` lines scroll away when Claude starts; the indicator under the text box stays.
+
+The indicator also covers plain `claude`. It's set in `~/.claude/settings.json`, which every Claude session you start on Chinook reads, so starting Claude any way other than `tclaude` shows an amber `NOT SANDBOXED` warning instead. To move that session into the sandbox, type `/exit`, then run `tclaude run --continue`.
+
+<img src="docs/not-sandboxed.svg" width="1000" alt="Running plain claude in ~/my-project, without tclaude: an amber 'NOT SANDBOXED' badge under Claude's text box, followed by 'Claude can write anywhere you can'.">
+
+You get the warning once you've done the settings step of [Claude settings and rules](#claude-settings-and-rules).
 
 ## Contents
 
@@ -36,7 +42,7 @@ Everything else on the filesystem is read-only to Claude. The `writable:` lines 
 | `config/tmux.conf` | `~/.tmux.conf` | tmux settings that suit Claude Code |
 | `config/claude-settings.json` | `~/.claude/settings.json` | Permission rules enforced by Claude Code, and the indicator (template) |
 | `config/claude-rules.md` | `~/.claude/CLAUDE.md` | Instructions Claude reads every session (template) |
-| `docs/terminal.svg` | — | The terminal image at the top of this README |
+| `docs/terminal.svg`, `docs/not-sandboxed.svg` | — | The terminal images at the top of this README |
 
 ## Why not Claude Code's own sandbox
 
@@ -196,7 +202,7 @@ export TCLAUDE_WRITE_DIRS=/beegfs/CMIP6/$USER/my-project-data   # optional, colo
 tclaude
 ```
 
-- **Check the indicator under Claude's text box.** `tclaude sandbox` on blue, followed by the directories Claude can write, means you're sandboxed. `NOT SANDBOXED` on amber means Claude can write anywhere you can. It tests whether your home directory is actually read-only, so it's right even if Claude was started some other way.
+- **Check the indicator under Claude's text box.** `tclaude sandbox` on blue, followed by the directories Claude can write, means you're sandboxed. A grey line under it reminds you how to add a directory. `NOT SANDBOXED` on amber means Claude can write anywhere you can. It tests whether your home directory is actually read-only, so it's right even if Claude was started some other way.
 - **The tmux tabs are colour-coded too.** The `tclaude` window's tab is blue and the `chinook_terminal` tab is amber. The colours show what each window is for, not what's running in it: if Claude exits, the `tclaude` window is an ordinary unsandboxed shell. The indicator is what to trust.
 - **`export` matters.** A plain `VAR=value` line isn't passed to `tclaude`. Missing directories are skipped with a warning. `/`, `$HOME` and its parent directories are refused, and so is anything inside `/import/SNAP`.
 - **To change the write list mid-session,** type `/exit` in Claude, then `export TCLAUDE_WRITE_DIRS=…` and `tclaude run --continue`. The conversation resumes with the new list. A running sandbox can't be widened, so restarting is the only way.

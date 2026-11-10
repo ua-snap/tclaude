@@ -17,6 +17,9 @@ if [ -n "${TCLAUDE_SANDBOX:-}" ] && [ ! -w "$HOME" ]; then
     list="${list:+$list, }$d"
   done
   printf '\033[1;38;5;231;48;5;25m tclaude sandbox \033[0m writes only: %s\n' "${list:-?}"
+  # Second line, in grey: how to add a directory (keeps the current ones)
+  printf '\033[38;5;245m add a directory: /exit, then %s\033[0m\n' \
+    'export TCLAUDE_WRITE_DIRS="$TCLAUDE_WRITE_DIRS:/new/dir"; tclaude run --continue'
 else
   printf '\033[1;38;5;16;48;5;214m NOT SANDBOXED \033[0m Claude can write anywhere you can\n'
 fi
