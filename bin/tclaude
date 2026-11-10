@@ -1,0 +1,420 @@
+#!/usr/bin/env bash
+# tclaude: start (or reattach to) a tmux session for the current directory,
+# running Claude Code inside a bubblewrap sandbox that can only write to:
+#   - the current directory (the repo)
+#   - ~/tmp (also used as TMPDIR) and a throwaway in-memory /tmp
+#   - Claude's own state (~/.claude), except settings.json and CLAUDE.md
+#   - any directories listed in TCLAUDE_WRITE_DIRS (colon-separated, like PATH)
+# Everything else on the filesystem is read-only. So are the protected_dirs below (/import/SNAP),
+# even if they're listed in TCLAUDE_WRITE_DIRS or inside a listed directory.
+#
+# Slurm: real Slurm is unreachable from inside the sandbox (its munge socket is hidden).
+# Instead, sbatch/squeue/sacct/sinfo/scontrol show/scancel inside the sandbox are passed to a
+# broker running outside it, which only allows safe sbatch options and wraps every job so it
+# runs under bubblewrap on the compute node with the same write limits (minus ~/.claude).
+# Jobs need a copy of bwrap at ~/.local/bin/bwrap, since compute nodes don't have one.
+# Requests and job submissions are logged to ~/.cache/tclaude/broker.log.
+#
+# Usage:
+#   tclaude              create/attach tmux session tclaude_<dirname>
+#   tclaude run [args]   start claude in the sandbox; args go to claude (e.g. --continue)
+#   tclaude exec cmd...  run any command in the same sandbox (for testing)
+#
+# To change TCLAUDE_WRITE_DIRS mid-session, in the tclaude window:
+#   /exit, then:  export TCLAUDE_WRITE_DIRS=...;  tclaude run --continue
+set -euo pipefail
+
+self="$(realpath "$0")"
+cache="$HOME/.cache/tclaude"
+# Slurm commands replaced inside the sandbox; the broker decides which ones actually run
+slurm_cmds=(sbatch squeue sacct sinfo sstat sprio sshare scontrol scancel
+            srun salloc sattach sbcast scrontab strigger sacctmgr sreport sdiag)
+# Always read-only, even if listed in TCLAUDE_WRITE_DIRS or inside a listed directory
+protected_dirs=(/import/SNAP)   # SNAP's canonical data
+
+die() { echo "tclaude: $*" >&2; exit 1; }
+
+# True if $1 is / or $HOME or an ancestor of $HOME (making it writable would defeat the sandbox)
+too_broad() {
+  local home; home="$(realpath "$HOME")"
+  [ "$1" = / ] || [[ "$home/" == "$1/"* ]]
+}
+
+# Prints the protected directory that $1 is or is inside, if any (uses sandbox's $protected)
+protected_by() {
+  local p
+  for p in "${protected[@]}"; do
+    if [ "$1" = "$p" ] || [[ "$1" == "$p/"* ]]; then printf '%s' "$p"; return 0; fi
+  done
+  return 1
+}
+
+# ---- inside the sandbox: Slurm commands send their arguments to the broker ----
+
+client() {
+  local cmd="$1"; shift
+  local b="${TCLAUDE_BROKER:-}"
+  [ -n "$b" ] && [ -d "$b/req" ] || die "$cmd: Slurm is only reachable through the tclaude broker, which isn't running here"
+  local d; d="$(mktemp -d "$b/req/r.XXXXXX")"
+  local id="${d##*/}"
+  printf '%s' "$cmd" > "$d/cmd"
+  printf '%s' "$PWD" > "$d/cwd"
+  if [ $# -gt 0 ]; then printf '%s\0' "$@"; fi > "$d/args"
+  : > "$d/ready"
+  local i=0
+  until [ -e "$b/rep/$id.rc" ]; do
+    sleep 0.2
+    i=$((i + 1))
+    [ "$i" -lt 1500 ] || die "$cmd: no reply from the tclaude broker after 5 minutes"
+  done
+  cat "$b/rep/$id.out"
+  cat "$b/rep/$id.err" >&2
+  return "$(cat "$b/rep/$id.rc")"
+}
+
+case "${0##*/}" in
+  sbatch|squeue|sacct|sinfo|sstat|sprio|sshare|scontrol|scancel|srun|salloc|sattach|sbcast|scrontab|strigger|sacctmgr|sreport|sdiag)
+    rc=0; client "${0##*/}" "$@" || rc=$?; exit "$rc" ;;
+esac
+
+# ---- outside the sandbox: the broker ----
+
+# sbatch options allowed from the sandbox. Anything else is refused: some options (--export,
+# --get-user-env, ...) could make the job's wrapper run code before its sandbox starts.
+# Abbreviated option names are refused too, so they can't sneak past this list.
+sb_val=" account array chdir comment constraint cpus-per-task dependency error exclude gres job-name mail-type mail-user mem mem-per-cpu nodelist nodes ntasks ntasks-per-node output partition qos signal time time-min "
+sb_flag=" exclusive hold parsable requeue no-requeue test-only "
+
+blog() { printf '%s %s\n' "$(date '+%F %T')" "$*" >&3; }
+
+# Check sbatch options; mode is "cli" (stops at the script name) or "header" (one #SBATCH line).
+# Sets o_keep (options to pass on), o_next (index of the script name), and o_out/o_err/o_wrap.
+sb_parse() {
+  local mode="$1"; shift
+  local -a t=("$@")
+  local i=0 tok name val has
+  o_keep=()
+  while [ "$i" -lt "${#t[@]}" ]; do
+    tok="${t[$i]}"
+    case "$tok" in
+      --)    i=$((i + 1)); break ;;
+      --*=*) name="${tok%%=*}"; name="${name#--}"; val="${tok#*=}"; has=1 ;;
+      --*)   name="${tok#--}"; has=0 ;;
+      -?*)
+        case "${tok:1:1}" in
+          A) name=account ;; a) name=array ;; C) name=constraint ;; c) name=cpus-per-task ;;
+          D) name=chdir ;; d) name=dependency ;; e) name=error ;; J) name=job-name ;;
+          N) name=nodes ;; n) name=ntasks ;; o) name=output ;; p) name=partition ;;
+          q) name=qos ;; t) name=time ;; w) name=nodelist ;; x) name=exclude ;;
+          *) echo "tclaude: sbatch: option $tok isn't allowed from the sandbox" >&2; return 1 ;;
+        esac
+        if [ "${#tok}" -gt 2 ]; then val="${tok:2}"; has=1; else has=0; fi ;;
+      *)
+        if [ "$mode" = header ]; then i=$((i + 1)); continue; fi
+        break ;;
+    esac
+    if [[ "$sb_flag" == *" $name "* ]] && [ "$has" = 0 ]; then
+      o_keep+=("--$name")
+    elif [[ "$sb_val" == *" $name "* ]] || { [ "$name" = wrap ] && [ "$mode" = cli ]; }; then
+      if [ "$has" = 0 ]; then
+        i=$((i + 1))
+        [ "$i" -lt "${#t[@]}" ] || { echo "tclaude: sbatch: $tok needs a value" >&2; return 1; }
+        val="${t[$i]}"
+      fi
+      case "$name" in
+        output) o_out="$val" ;;
+        error)  o_err="$val" ;;
+        wrap)   o_wrap="$val" ;;
+        *)      o_keep+=("--$name=$val") ;;
+      esac
+    else
+      echo "tclaude: sbatch: option $tok isn't allowed from the sandbox" >&2
+      return 1
+    fi
+    i=$((i + 1))
+  done
+  o_next=$i
+}
+
+broker_sbatch() {
+  [ -x "$job_bwrap" ] || { echo "tclaude: sbatch: jobs need bubblewrap at $job_bwrap (cp \"\$(command -v bwrap)\" $job_bwrap)" >&2; return 1; }
+  o_out="" o_err="" o_wrap=""
+  sb_parse cli "$@" || return 1
+  local -a keep=(${o_keep[@]+"${o_keep[@]}"}) rest=("${@:o_next+1}")
+  local c_out="$o_out" c_err="$o_err" wrap="$o_wrap"
+  o_out="" o_err=""
+
+  local job name src header=""
+  job="$(mktemp -d "$cache/jobs/$(date +%Y%m%d-%H%M%S).XXXX")"
+  mkdir "$job/src"
+  if [ -n "$wrap" ]; then
+    [ "${#rest[@]}" -eq 0 ] || { echo "tclaude: sbatch: give either --wrap or a script, not both" >&2; return 1; }
+    name=wrap src="--wrap"
+    printf '#!/bin/bash\n%s\n' "$wrap" > "$job/src/$name"
+  else
+    [ "${#rest[@]}" -gt 0 ] || { echo "tclaude: sbatch: no job script given (scripts on stdin aren't supported here; write it to a file)" >&2; return 1; }
+    src="${rest[0]}"; rest=("${rest[@]:1}")
+    [ -f "$src" ] && [ -r "$src" ] || { echo "tclaude: sbatch: can't read job script '$src'" >&2; return 1; }
+    name="$(basename -- "$src")"
+    cp -- "$src" "$job/src/$name"   # snapshot, so later edits don't change the queued job
+    [ "$(head -c2 "$job/src/$name")" = '#!' ] || { echo "tclaude: sbatch: '$src' doesn't start with a #! line" >&2; return 1; }
+    # Its #SBATCH lines, read the way sbatch does: from the comment block at the top
+    local line
+    local -a toks
+    {
+      IFS= read -r line   # the #! line
+      while IFS= read -r line; do
+        case "$line" in
+          '#SBATCH'*)
+            read -ra toks <<< "${line#\#SBATCH}"
+            sb_parse header ${toks[@]+"${toks[@]}"} || return 1
+            header+="$line"$'\n' ;;
+          '#'*) ;;
+          *) [[ "$line" =~ ^[[:space:]]*$ ]] || break ;;
+        esac
+      done
+    } < "$job/src/$name"
+  fi
+  chmod +x "$job/src/$name"
+
+  # The script Slurm actually runs: the job's #SBATCH lines, then its script under bubblewrap.
+  # Slurm opens --output/--error itself, outside any sandbox, so those always point at
+  # ~/.cache/tclaude/slurm-logs; the wrapper opens the paths the job asked for inside the sandbox.
+  {
+    echo '#!/bin/bash -p'
+    printf '%s' "$header"
+    echo "# Generated by tclaude from $src: runs it inside a bubblewrap write-sandbox."
+    printf 'out=%q err=%q script=%q\n' "${c_out:-$o_out}" "${c_err:-$o_err}" "$job/src/$name"
+    printf 'sandbox=(%s)\n' "$(printf '%q ' "${job_sandbox[@]}")"
+    cat <<'EOF'
+expand() {  # fill in the %-patterns Slurm allows in output file names
+  local p="$1"
+  p="${p//"%%"/$'\001'}"
+  p="${p//"%A"/${SLURM_ARRAY_JOB_ID:-$SLURM_JOB_ID}}"
+  p="${p//"%a"/${SLURM_ARRAY_TASK_ID:-4294967294}}"
+  p="${p//"%j"/$SLURM_JOB_ID}"
+  p="${p//"%x"/$SLURM_JOB_NAME}"
+  p="${p//"%u"/${USER:-$(id -un)}}"
+  p="${p//"%N"/$(hostname -s)}"
+  printf '%s' "${p//$'\001'/%}"
+}
+if [ -z "$out" ]; then
+  if [ -n "${SLURM_ARRAY_JOB_ID:-}" ]; then out='slurm-%A_%a.out'; else out='slurm-%j.out'; fi
+fi
+out="$(expand "$out")"
+[ -z "$err" ] || err="$(expand "$err")"
+exec "${sandbox[@]}" --chdir "$PWD" /bin/bash -p -c '
+  exec >"$1" && if [ -n "$2" ]; then exec 2>"$2"; else exec 2>&1; fi ||
+    { echo "tclaude: job output path is read-only in the sandbox: $1 $2" >&2; exit 1; }
+  shift 2; exec "$@"' tclaude-job "$out" "$err" "$script" "$@"
+EOF
+  } > "$job/$name"
+  chmod +x "$job/$name"
+
+  local res rc=0
+  res="$(sbatch ${keep[@]+"${keep[@]}"} --output="$cache/slurm-logs/%j.out" --error="$cache/slurm-logs/%j.out" \
+         "$job/$name" ${rest[@]+"${rest[@]}"})" || rc=$?
+  [ -z "$res" ] || printf '%s\n' "$res"
+  local id; id="$(grep -oE '[0-9]+' <<< "$res" | head -1 || true)"
+  if [ "$rc" -eq 0 ] && [ -n "$id" ]; then
+    echo "$id" >> "$cache/jobs.list"
+    blog "  submitted job $id from $src (snapshot $job)"
+  fi
+  return "$rc"
+}
+
+broker_scancel() {
+  [ $# -gt 0 ] || { echo "tclaude: scancel: give one or more job IDs" >&2; return 1; }
+  local j
+  for j in "$@"; do
+    [[ "$j" =~ ^[0-9]+(_[0-9]+)?$ ]] || { echo "tclaude: scancel: only job IDs are allowed from the sandbox (got '$j')" >&2; return 1; }
+    grep -qx "${j%%_*}" "$cache/jobs.list" 2>/dev/null ||
+      { echo "tclaude: scancel: job ${j%%_*} wasn't submitted from a tclaude sandbox; cancel it yourself if you mean to" >&2; return 1; }
+  done
+  scancel "$@"
+}
+
+handle() {  # one request directory from the sandbox
+  local d="$1" f cmd cwd x
+  for f in cmd cwd args; do
+    [ -f "$d/$f" ] && [ ! -L "$d/$f" ] || { echo "tclaude: malformed request" >&2; return 2; }
+  done
+  cmd="$(cat "$d/cmd")"; cwd="$(cat "$d/cwd")"
+  local -a a=()
+  while IFS= read -r -d '' x; do a+=("$x"); done < "$d/args"
+  cd "$cwd" 2>/dev/null || cd /
+  blog "$cmd ${a[*]} (in $cwd)"
+  case "$cmd" in
+    sbatch) broker_sbatch "${a[@]}" ;;
+    squeue|sacct|sinfo|sstat|sprio|sshare) "$cmd" "${a[@]}" ;;  # read-only
+    scontrol)
+      [ "${a[0]:-}" = show ] || { echo "tclaude: only 'scontrol show ...' is allowed from the sandbox" >&2; return 1; }
+      scontrol "${a[@]}" ;;
+    scancel) broker_scancel "${a[@]}" ;;
+    *) echo "tclaude: $cmd isn't available from the sandbox; run it yourself in another window" >&2; return 1 ;;
+  esac
+}
+
+broker() {
+  set +eu
+  exec 3>>"$cache/broker.log"
+  local r d id
+  while sleep 0.3; do
+    for r in "$sess"/req/r.*/ready; do
+      [ -e "$r" ] || continue
+      d="${r%/ready}"; id="${d##*/}"
+      if [[ "$id" =~ ^r\.[A-Za-z0-9]+$ ]] && [ ! -L "$d" ]; then
+        ( handle "$d" ) > "$sess/rep/$id.out" 2> "$sess/rep/$id.err"
+        echo "$?" > "$sess/rep/$id.tmp" && mv "$sess/rep/$id.tmp" "$sess/rep/$id.rc"
+      fi
+      rm -rf "$d"
+    done
+  done
+}
+
+# ---- the sandbox ----
+
+sandbox() {
+  [ -z "${TCLAUDE_SANDBOX:-}" ] || die "already inside a tclaude sandbox"
+  local bwrap="$HOME/.local/bin/bwrap"
+  [ -x "$bwrap" ] || bwrap="$(command -v bwrap)" || die "bwrap (bubblewrap) not found"
+
+  local -a protected=()
+  local p
+  for p in "${protected_dirs[@]}"; do
+    if [ -e "$p" ]; then p="$(realpath "$p")"; fi
+    protected+=("$p")
+  done
+
+  local repo; repo="$(realpath "$PWD")"
+  if too_broad "$repo"; then die "refusing to make $repo writable; run from inside a repo"; fi
+  if p="$(protected_by "$repo")"; then die "refusing to make $repo writable; $p is always read-only"; fi
+
+  local config="$HOME/.claude"
+  mkdir -p "$HOME/tmp" "$config"
+  # Claude normally keeps ~/.claude.json directly in $HOME, which is read-only in here,
+  # so point it at a copy inside ~/.claude instead (seeded once to keep login and settings).
+  if [ ! -e "$config/.claude.json" ] && [ -e "$HOME/.claude.json" ]; then
+    cp -p "$HOME/.claude.json" "$config/.claude.json"
+  fi
+
+  local tmp; tmp="$(realpath "$HOME/tmp")"
+  local -a writable=("$repo" "$tmp")   # what jobs get too
+  local -a extra=()
+  local entry path
+  IFS=':' read -ra extra <<< "${TCLAUDE_WRITE_DIRS:-}"
+  for entry in ${extra[@]+"${extra[@]}"}; do
+    [ -n "$entry" ] || continue
+    entry="${entry/#\~/$HOME}"
+    if ! path="$(realpath -- "$entry" 2>/dev/null)" || [ ! -d "$path" ]; then
+      echo "tclaude: skipping '$entry' (not an existing directory)" >&2
+    elif too_broad "$path"; then
+      echo "tclaude: refusing '$entry' (would make $path writable)" >&2
+    elif p="$(protected_by "$path")"; then
+      echo "tclaude: refusing '$entry' ($p is always read-only)" >&2
+    else
+      writable+=("$path")
+    fi
+  done
+  local -a claude_dirs=("$(realpath "$config")")
+  # Other per-user Claude state, if present (its installed binaries stay read-only)
+  for path in "$HOME/.cache/claude" "$HOME/.local/state/claude"; do
+    if [ -d "$path" ]; then claude_dirs+=("$(realpath "$path")"); fi
+  done
+  printf 'tclaude: writable: %s\n' "${writable[@]}" "${claude_dirs[@]}" >&2
+
+  # Hide munge's socket so nothing in here can talk to Slurm directly
+  local -a mask=()
+  for path in /run/munge /var/run/munge; do
+    if [ -d "$path" ]; then
+      path="$(realpath "$path")"
+      [[ " ${mask[*]-} " == *" $path "* ]] || mask+=(--tmpfs "$path")
+    fi
+  done
+
+  local -a args=(--ro-bind / / --dev /dev --proc /proc --tmpfs /tmp --unshare-pid --die-with-parent
+                 ${mask[@]+"${mask[@]}"})
+  for path in "${writable[@]}" "${claude_dirs[@]}"; do args+=(--bind "$path" "$path"); done
+  # Claude's user settings and instructions stay read-only, so it can't loosen its own rules
+  for path in "$config/settings.json" "$config/CLAUDE.md"; do
+    if [ -f "$path" ]; then args+=(--ro-bind "$path" "$path"); fi
+  done
+  # Protected directories go on top, so a writable parent can't expose them
+  for p in "${protected[@]}"; do
+    if [ -d "$p" ]; then args+=(--ro-bind "$p" "$p"); fi
+  done
+  args+=(--setenv TMPDIR "$tmp"
+         --setenv TCLAUDE_WRITABLE "$(IFS=':'; printf '%s' "${writable[*]}")"   # for tclaude-statusline
+         --setenv CLAUDE_CONFIG_DIR "$config"
+         --setenv DISABLE_AUTOUPDATER 1   # can't update its own binary in here; update outside
+         --setenv TCLAUDE_SANDBOX 1
+         --chdir "$repo")
+
+  if command -v sbatch >/dev/null; then
+    job_bwrap="$HOME/.local/bin/bwrap"
+    job_sandbox=("$job_bwrap" --ro-bind / / --dev-bind /dev /dev --proc /proc --bind /tmp /tmp
+                 --unshare-pid --die-with-parent ${mask[@]+"${mask[@]}"})
+    for path in "${writable[@]}"; do job_sandbox+=(--bind "$path" "$path"); done
+    for p in "${protected[@]}"; do job_sandbox+=(--ro-bind-try "$p" "$p"); done   # -try: may be missing on a node
+    job_sandbox+=(--setenv TCLAUDE_SANDBOX 1)
+
+    sess="$(mktemp -d /tmp/tclaude.XXXXXX)"
+    mkdir "$sess/req" "$sess/rep"
+    mkdir -p "$cache/jobs" "$cache/slurm-logs"
+    for path in "${slurm_cmds[@]}"; do
+      if path="$(command -v "$path")"; then args+=(--ro-bind "$self" "$(realpath "$path")"); fi
+    done
+    args+=(--bind "$sess/req" "$sess/req" --ro-bind "$sess/rep" "$sess/rep" --setenv TCLAUDE_BROKER "$sess")
+
+    broker < /dev/null > /dev/null 2>&1 &
+    trap "kill $! 2>/dev/null; rm -rf $(printf %q "$sess")" EXIT
+    trap 'exit 129' HUP
+    trap 'exit 143' TERM
+  fi
+
+  "$bwrap" "${args[@]}" "$@"
+}
+
+case "${1:-}" in
+  run)  shift; sandbox claude "$@"; exit ;;
+  exec) shift; [ $# -gt 0 ] || die "usage: tclaude exec cmd..."; sandbox "$@"; exit ;;
+  "")   ;;  # no subcommand: set up tmux below
+  *)    die "usage: tclaude [run [claude args] | exec cmd...]" ;;
+esac
+
+dir="$PWD"
+repo="$(basename "$dir")"
+# tmux doesn't allow '.' or ':' in session names, so replace anything unusual with '_'
+name="tclaude_${repo//[^A-Za-z0-9_-]/_}"
+
+if ! tmux has-session -t "=$name" 2>/dev/null; then
+  tmux new-session -d -s "$name" -n tclaude -c "$dir"
+  tmux new-window -d -t "=$name:" -n chinook_terminal -c "$dir"
+  # A grey bar with a blue tab for the sandboxed window and an amber tab for the unsandboxed one
+  # (blue and amber stay distinct with red-green colour blindness)
+  tmux set-option -t "=$name" status-style "bg=colour236,fg=colour250"
+  tmux set-window-option -t "=$name:tclaude" window-status-style "bg=colour25,fg=colour231"
+  tmux set-window-option -t "=$name:tclaude" window-status-current-style "bg=colour25,fg=colour231,bold"
+  tmux set-window-option -t "=$name:chinook_terminal" window-status-style "bg=colour214,fg=colour16"
+  tmux set-window-option -t "=$name:chinook_terminal" window-status-current-style "bg=colour214,fg=colour16,bold"
+  # Launch via the window's shell so you land at a prompt (not a closed window) when claude exits.
+  # Carry over TCLAUDE_WRITE_DIRS from this shell, if set.
+  launch="$(printf '%q run' "$self")"
+  if [ -n "${TCLAUDE_WRITE_DIRS+x}" ]; then
+    launch="$(printf 'export TCLAUDE_WRITE_DIRS=%q; ' "$TCLAUDE_WRITE_DIRS")$launch"
+  fi
+  tmux send-keys -t "=$name:tclaude" "$launch" Enter
+  tmux select-window -t "=$name:tclaude"
+else
+  echo "Session '$name' already exists; attaching."
+  if [ -n "${TCLAUDE_WRITE_DIRS+x}" ]; then
+    echo "Note: it keeps its own TCLAUDE_WRITE_DIRS. To change it, in the tclaude window:"
+    echo "  /exit, then: export TCLAUDE_WRITE_DIRS=...; tclaude run --continue"
+  fi
+fi
+
+if [ -n "${TMUX:-}" ]; then
+  tmux switch-client -t "=$name"   # already inside tmux: hop over instead of nesting
+else
+  tmux attach-session -t "=$name"
+fi

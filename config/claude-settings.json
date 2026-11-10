@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "deny": [
+      "Edit(//import/SNAP/**)",
+      "Edit(//path/to/datasets/**)"
+    ],
+    "disableBypassPermissionsMode": "disable"
+  },
+  "disableAutoMode": "disable",
+  "statusLine": {
+    "type": "command",
+    "command": "~/.local/bin/tclaude-statusline"
+  }
+}

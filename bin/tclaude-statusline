@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# tclaude-statusline: Claude Code status line saying whether Claude is in the tclaude sandbox.
+# Set it in ~/.claude/settings.json (see config/claude-settings.json):
+#   "statusLine": {"type": "command", "command": "~/.local/bin/tclaude-statusline"}
+# Blue means sandboxed, amber means not. Those two stay distinct with red-green colour
+# blindness, and the wording differs too, so the colour is never the only cue.
+cat > /dev/null   # Claude Code sends session details as JSON on stdin; not needed here
+
+# Check the filesystem, not just the variable: inside the sandbox $HOME is read-only
+if [ -n "${TCLAUDE_SANDBOX:-}" ] && [ ! -w "$HOME" ]; then
+  home="$(realpath "$HOME")"
+  list=""
+  IFS=':' read -ra dirs <<< "${TCLAUDE_WRITABLE:-}"
+  for d in ${dirs[@]+"${dirs[@]}"}; do
+    [ -w "$d" ] || continue
+    case "$d" in "$home"/*) d="~/${d#"$home"/}" ;; esac
+    list="${list:+$list, }$d"
+  done
+  printf '\033[1;38;5;231;48;5;25m tclaude sandbox \033[0m writes only: %s\n' "${list:-?}"
+else
+  printf '\033[1;38;5;16;48;5;214m NOT SANDBOXED \033[0m Claude can write anywhere you can\n'
+fi

@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+# tclaude-test: check that the tclaude sandbox allows and blocks writes as intended.
+#   bash tclaude-test [path/to/tclaude]
+# Optional: TCLAUDE_TEST_DATA=/path/to/real/data/dir also checks that a data directory
+# you can normally write to is read-only in the sandbox (creates and removes one probe file).
+# Works in a scratch area under $HOME/tclaude-test.XXXXXX, removed on exit.
+set -u
+
+TCLAUDE="${1:-$(command -v tclaude || true)}"
+[ -n "$TCLAUDE" ] && [ -x "$TCLAUDE" ] || { echo "tclaude not found; pass its path as the first argument"; exit 1; }
+TCLAUDE="$(realpath "$TCLAUDE")"
+
+base="$(mktemp -d "$HOME/tclaude-test.XXXXXX")"
+repo="$base/repo" extra="$base/extra" outside="$base/outside"
+mkdir -p "$repo" "$extra" "$outside"
+echo original > "$outside/existing.txt"
+probe=".tclaude_probe_$$"
+trap 'rm -rf "$base" "$HOME/$probe" "$HOME/tmp/$probe" "$HOME/.claude/$probe" "/tmp/$probe"' EXIT
+
+npass=0 nfail=0
+pass() { echo "PASS  $1"; npass=$((npass+1)); }
+fail() { echo "FAIL  $1"; nfail=$((nfail+1)); }
+warn() { echo "WARN  $1"; }
+
+WD=""   # TCLAUDE_WRITE_DIRS used by sb
+sb()     { (cd "$repo" && TCLAUDE_WRITE_DIRS="$WD" "$TCLAUDE" exec sh -c "$1") >/dev/null 2>&1; }
+sb_err() { (cd "$repo" && TCLAUDE_WRITE_DIRS="$WD" "$TCLAUDE" exec sh -c "$1") 2>&1 >/dev/null; }
+allowed() { if sb "$2"; then pass "$1"; else fail "$1"; fi; }
+blocked() { if sb "$2"; then fail "$1"; else pass "$1"; fi; }
+
+echo "== prerequisites"
+echo "bwrap: $(bwrap --version 2>&1 || echo MISSING)"
+echo "tmux:  $(tmux -V 2>&1 || echo MISSING)"
+if ! out="$(cd "$repo" && "$TCLAUDE" exec true 2>&1)"; then
+  echo "FAIL  sandbox could not start:"; echo "$out"; exit 1
+fi
+pass "sandbox starts"
+echo "$out" | sed 's/^/      /'
+
+echo "== default: allowed"
+allowed "write in repo (cwd)"                "echo hi > new.txt"
+allowed "write in ~/tmp"                     "touch '$HOME/tmp/$probe'"
+allowed "TMPDIR is ~/tmp and usable"         "[ \"\$TMPDIR\" = \"\$(realpath '$HOME/tmp')\" ] && f=\$(mktemp) && rm \"\$f\""
+allowed "write in /tmp"                      "touch '/tmp/$probe'"
+if [ -e "/tmp/$probe" ]; then fail "sandbox /tmp is private"; else pass "sandbox /tmp is private"; fi
+allowed "write in ~/.claude"                 "touch '$HOME/.claude/$probe' && rm '$HOME/.claude/$probe'"
+allowed "CLAUDE_CONFIG_DIR points at ~/.claude" "[ \"\$CLAUDE_CONFIG_DIR\" = '$HOME/.claude' ]"
+allowed "git init + commit in repo"          "git init -q && git -c user.name=t -c user.email=t@t commit -q --allow-empty -m t"
+
+echo "== default: blocked"
+blocked "create file in \$HOME"              "touch '$HOME/$probe'"
+blocked "create file outside repo"           "touch '$outside/new.txt'"
+blocked "append to existing file"            "echo x >> '$outside/existing.txt'"
+blocked "delete existing file"               "rm -f '$outside/existing.txt'"
+blocked "rename existing file"               "mv '$outside/existing.txt' '$outside/moved.txt'"
+blocked "unlisted dir not writable"          "touch '$extra/x'"
+if [ "$(cat "$outside/existing.txt" 2>/dev/null)" = original ]; then pass "existing file unchanged on disk"
+else fail "existing file unchanged on disk"; fi
+if [ -n "${TCLAUDE_TEST_DATA:-}" ]; then
+  if touch "$TCLAUDE_TEST_DATA/$probe" 2>/dev/null; then
+    rm -f "$TCLAUDE_TEST_DATA/$probe"
+    blocked "data dir $TCLAUDE_TEST_DATA read-only" "touch '$TCLAUDE_TEST_DATA/$probe'"
+    rm -f "$TCLAUDE_TEST_DATA/$probe"
+  else
+    warn "can't write $TCLAUDE_TEST_DATA even outside the sandbox; nothing to test"
+  fi
+fi
+
+echo "== Claude settings and status line"
+for f in "$HOME/.claude/settings.json" "$HOME/.claude/CLAUDE.md"; do
+  if [ -f "$f" ]; then blocked "~${f#"$HOME"} read-only" "[ -w '$f' ]"
+  else warn "no ~${f#"$HOME"}; skipping its read-only check"; fi
+done
+SL="$(dirname "$TCLAUDE")/tclaude-statusline"
+if [ -x "$SL" ]; then
+  allowed "status line shows the sandbox inside"  "'$SL' </dev/null | grep -q 'tclaude sandbox'"
+  if "$SL" </dev/null | grep -q 'NOT SANDBOXED'; then pass "status line warns outside"
+  else fail "status line warns outside"; fi
+  if TCLAUDE_SANDBOX=1 "$SL" </dev/null | grep -q 'NOT SANDBOXED'; then pass "status line not fooled by TCLAUDE_SANDBOX=1 outside"
+  else fail "status line not fooled by TCLAUDE_SANDBOX=1 outside"; fi
+else
+  warn "no tclaude-statusline next to $TCLAUDE; skipping the status line checks"
+fi
+
+echo "== TCLAUDE_WRITE_DIRS"
+WD="$extra"
+allowed "listed dir writable"                "touch '$extra/x'"
+blocked "unlisted dir still blocked"         "touch '$outside/new.txt'"
+WD="$extra:$outside"
+allowed "two dirs: first writable"           "touch '$extra/y'"
+allowed "two dirs: second writable"          "touch '$outside/y'"
+WD="~/${extra#"$HOME"/}"
+allowed "~ is expanded"                      "touch '$extra/z'"
+WD="$base/does-not-exist:$extra"
+if sb_err "true" | grep -q skipping; then pass "missing dir skipped with warning"; else fail "missing dir skipped with warning"; fi
+allowed "...and the rest still applies"      "touch '$extra/w'"
+for bad in / "$HOME" "$(dirname "$HOME")"; do
+  WD="$bad"
+  if sb_err "true" | grep -q refusing; then pass "refuses '$bad'"; else fail "refuses '$bad'"; fi
+  blocked "...and \$HOME stays read-only"    "touch '$HOME/$probe'"
+done
+snap=/import/SNAP   # in tclaude's protected_dirs
+if [ -d "$snap" ]; then
+  WD="$snap"
+  if sb_err "true" | grep -q 'always read-only'; then pass "refuses $snap"; else fail "refuses $snap"; fi
+  blocked "...and $snap stays read-only"     "[ -w '$(realpath "$snap")' ]"
+else
+  warn "no $snap on this machine; skipping its checks"
+fi
+WD=""
+
+echo "== escape attempts (all should be blocked)"
+blocked "nested tclaude widening access"     "TCLAUDE_WRITE_DIRS='$outside' '$TCLAUDE' exec touch '$outside/nested'"
+blocked "raw nested bwrap --bind"            "bwrap --ro-bind / / --bind '$outside' '$outside' touch '$outside/nested'"
+blocked "remount / read-write"               "mount -o remount,rw /"
+blocked "remount a dir read-write"           "mount --bind '$outside' '$outside' && touch '$outside/nested'"
+if (cd "$HOME" && "$TCLAUDE" exec true) >/dev/null 2>&1; then fail "refuses to run from \$HOME"
+else pass "refuses to run from \$HOME"; fi
+
+echo "== side doors (informational: these run outside the sandbox if they work)"
+if sb "ssh -o BatchMode=yes -o ConnectTimeout=5 localhost true"; then
+  warn "passwordless ssh works from inside: a shell started over ssh is NOT sandboxed"
+fi
+
+if ! command -v sbatch >/dev/null; then
+  warn "no sbatch on this machine; skipping the Slurm tests"
+else
+  part="${TCLAUDE_TEST_PARTITION:-debug}"
+  sb_out() { (cd "$repo" && TCLAUDE_WRITE_DIRS="$WD" "$TCLAUDE" exec sh -c "$1") 2>/dev/null; }
+
+  echo "== Slurm: direct access is blocked"
+  cp "$(realpath "$(command -v squeue)")" "$base/squeue-copy"
+  if "$base/squeue-copy" -h -u "$USER" >/dev/null 2>&1; then
+    blocked "copied squeue binary can't reach Slurm" "'$base/squeue-copy' -h -u \"\$USER\""
+  else
+    warn "a copied squeue doesn't work even outside the sandbox; skipping that check"
+  fi
+  blocked "srun refused"                       "srun true"
+  blocked "salloc refused"                     "salloc true"
+  blocked "scontrol other than show refused"   "scontrol hold 1"
+  blocked "scancel of a job not from tclaude"  "scancel 1"
+
+  echo "== Slurm: the broker"
+  allowed "squeue works"                       "squeue -h -u \"\$USER\""
+  allowed "sinfo works"                        "sinfo -s"
+  allowed "scontrol show works"                "scontrol show partition '$part'"
+  mkdir -p "$repo/logs"
+  printf '#!/bin/bash\n#SBATCH -p %s\n#SBATCH -t 00:01:00\ntrue\n' "$part" > "$repo/ok.sh"
+  printf '#!/bin/bash\n#SBATCH -p %s\n#SBATCH --export=NONE\ntrue\n' "$part" > "$repo/bad_header.sh"
+  printf 'true\n' > "$repo/no_shebang.sh"
+  blocked "sbatch --export refused"            "sbatch --export=ALL ok.sh"
+  blocked "abbreviated option refused"         "sbatch --exp=ALL ok.sh"
+  blocked "sbatch --get-user-env refused"      "sbatch --get-user-env ok.sh"
+  blocked "#SBATCH --export in script refused" "sbatch bad_header.sh"
+  blocked "script without #! refused"          "sbatch no_shebang.sh"
+  allowed "sbatch --test-only accepted"        "sbatch --test-only ok.sh"
+  held="$(sb_out "sbatch --parsable --hold -p '$part' -t 00:01:00 --wrap true")"; held="${held%%;*}"
+  if [ -n "$held" ]; then
+    pass "held job submitted ($held)"
+    allowed "scancel of own tclaude job"       "scancel '$held'"
+  else
+    fail "held job submitted"
+  fi
+
+  echo "== Slurm: real jobs (runs 3 tiny jobs on '$part')"
+  WD="$extra"
+  ln -s "$outside/hijacked" "$repo/logs/hijack.out"
+  cat > "$repo/tctest.slurm" <<EOF
+#!/bin/bash
+#SBATCH --job-name=tctest
+#SBATCH --partition=$part
+#SBATCH --time=00:02:00
+#SBATCH --ntasks=1
+#SBATCH --output=logs/%x_%j.out
+echo "args: \$*"
+echo "sandbox=\${TCLAUDE_SANDBOX:-}"
+echo "host=\$(hostname -s)"
+touch '$repo/job_repo' && echo repo-ok
+touch '$extra/job_extra' && echo extra-ok
+touch '$outside/job_outside' 2>/dev/null && echo OUTSIDE-WRITTEN || echo outside-blocked
+touch '$HOME/.claude/$probe' 2>/dev/null && echo CLAUDE-DIR-WRITTEN || echo claude-dir-blocked
+sbatch --wrap true >/dev/null 2>&1 && echo NESTED-SUBMITTED || echo nested-blocked
+EOF
+  j1="$(sb_out "sbatch --parsable tctest.slurm one two")"; j1="${j1%%;*}"
+  j2="$(sb_out "sbatch --parsable -p '$part' -t 00:01:00 -o '$outside/direct.out' --wrap 'echo hi'")"; j2="${j2%%;*}"
+  j3="$(sb_out "sbatch --parsable -p '$part' -t 00:01:00 -o logs/hijack.out --wrap 'echo hi'")"; j3="${j3%%;*}"
+  if [ -z "$j1" ] || [ -z "$j2" ] || [ -z "$j3" ]; then
+    fail "submit test jobs (got '$j1' '$j2' '$j3')"
+  else
+    pass "submitted test jobs $j1 $j2 $j3"
+    echo "      waiting for them to finish (up to 10 min)..."
+    for _ in $(seq 120); do
+      [ -z "$(squeue -h -j "$j1,$j2,$j3" 2>/dev/null)" ] && break
+      sleep 5
+    done
+    left="$(squeue -h -j "$j1,$j2,$j3" -o '%i %t %R' 2>/dev/null)"
+    [ -z "$left" ] || warn "still queued after 10 min, so their checks below will fail: $left"
+    log1="$repo/logs/tctest_$j1.out"
+    if [ -f "$log1" ]; then pass "job log written where the script asked"; else fail "job log written where the script asked ($log1)"; fi
+    in_log() { if grep -qx "$2" "$log1" 2>/dev/null; then pass "$1"; else fail "$1"; fi; }
+    in_log "job got its arguments"             "args: one two"
+    in_log "job ran inside the sandbox"        "sandbox=1"
+    in_log "job can write the repo"            "repo-ok"
+    in_log "job can write TCLAUDE_WRITE_DIRS"  "extra-ok"
+    in_log "job can't write outside"           "outside-blocked"
+    in_log "job can't write ~/.claude"         "claude-dir-blocked"
+    in_log "job can't submit more jobs"        "nested-blocked"
+    # These jobs must have run and been refused, not just never started
+    refused() { grep -q 'read-only in the sandbox' "$HOME/.cache/tclaude/slurm-logs/$1.out" 2>/dev/null; }
+    if [ ! -e "$outside/direct.out" ] && refused "$j2"; then pass "--output outside the write list refused"
+    else fail "--output outside the write list refused (see ~/.cache/tclaude/slurm-logs/$j2.out)"; fi
+    if [ ! -e "$outside/hijacked" ] && refused "$j3"; then pass "symlinked --output can't redirect writes"
+    else fail "symlinked --output can't redirect writes (see ~/.cache/tclaude/slurm-logs/$j3.out)"; fi
+    echo "      job 1 ran on $(grep '^host=' "$log1" 2>/dev/null | cut -d= -f2); Slurm's own logs: ~/.cache/tclaude/slurm-logs/{$j1,$j2,$j3}.out"
+  fi
+fi
+
+echo
+echo "$npass passed, $nfail failed"
+[ "$nfail" -eq 0 ]
