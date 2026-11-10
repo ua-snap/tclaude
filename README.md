@@ -10,19 +10,9 @@ Claude can write only to the repo and the directories you list. Slurm jobs it su
 - `/import/SNAP` is always read-only, whatever you list
 - 68-check test script
 
-```console
-$ cd ~/my-project
-$ export TCLAUDE_WRITE_DIRS=/beegfs/CMIP6/$USER/my-project-data
-$ tclaude
-tclaude: writable: /import/home/user/my-project
-tclaude: writable: /import/home/user/tmp
-tclaude: writable: /beegfs/CMIP6/user/my-project-data
-tclaude: writable: /import/home/user/.claude
-  Claude Code starts here, sandboxed
-[tclaude_my-project] 0:tclaude* 1:chinook_terminal-             "chinook04"
-```
+<img src="docs/terminal.svg" width="1000" alt="Running tclaude in ~/my-project with TCLAUDE_WRITE_DIRS set: tclaude lists the four writable directories, Claude Code starts, and a blue 'tclaude sandbox' badge under Claude's text box lists the directories Claude can write. The tmux bar shows session tclaude_my-project with a blue tab for window 0:tclaude and an amber tab for window 1:chinook_terminal.">
 
-Everything else on the filesystem is read-only to Claude.
+Everything else on the filesystem is read-only to Claude. The `writable:` lines scroll away when Claude starts; the indicator under the text box stays.
 
 ## Contents
 
@@ -46,6 +36,7 @@ Everything else on the filesystem is read-only to Claude.
 | `config/tmux.conf` | `~/.tmux.conf` | tmux settings that suit Claude Code |
 | `config/claude-settings.json` | `~/.claude/settings.json` | Permission rules enforced by Claude Code, and the indicator (template) |
 | `config/claude-rules.md` | `~/.claude/CLAUDE.md` | Instructions Claude reads every session (template) |
+| `docs/terminal.svg` | — | The terminal image at the top of this README |
 
 ## Why not Claude Code's own sandbox
 

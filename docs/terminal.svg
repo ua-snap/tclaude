@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="372" viewBox="0 0 1000 372" role="img" aria-labelledby="title desc">
+  <title id="title">tclaude starting in a tmux session</title>
+  <desc id="desc">A terminal: the user exports TCLAUDE_WRITE_DIRS and runs tclaude in my-project. tclaude lists the writable directories and Claude Code starts. Under Claude's text box, a blue badge reads "tclaude sandbox" followed by the directories Claude can write. The tmux bar at the bottom shows session tclaude_my-project, a blue tab for window 0:tclaude and an amber tab for window 1:chinook_terminal.</desc>
+  <style>
+    text { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; font-size: 14px; fill: #d9e7ed; white-space: pre; }
+    .dim { fill: #7f97a3; }
+    .bold { font-weight: 700; }
+  </style>
+
+  <!-- window -->
+  <rect width="1000" height="372" rx="10" fill="#101d25"/>
+  <circle cx="20" cy="16" r="5" fill="#ffffff" fill-opacity="0.16"/>
+  <circle cx="38" cy="16" r="5" fill="#ffffff" fill-opacity="0.16"/>
+  <circle cx="56" cy="16" r="5" fill="#ffffff" fill-opacity="0.16"/>
+  <line x1="0" y1="32.5" x2="1000" y2="32.5" stroke="#ffffff" stroke-opacity="0.07"/>
+
+  <!-- shell -->
+  <text x="20" y="60"><tspan class="dim">$</tspan> cd ~/my-project</text>
+  <text x="20" y="82"><tspan class="dim">$</tspan> export TCLAUDE_WRITE_DIRS=/beegfs/CMIP6/$USER/my-project-data</text>
+  <text x="20" y="104"><tspan class="dim">$</tspan> tclaude</text>
+  <text x="20" y="126">tclaude: writable: /import/home/user/my-project</text>
+  <text x="20" y="148">tclaude: writable: /import/home/user/tmp</text>
+  <text x="20" y="170">tclaude: writable: /beegfs/CMIP6/user/my-project-data</text>
+  <text x="20" y="192">tclaude: writable: /import/home/user/.claude</text>
+  <text x="20" y="236" class="dim">  … Claude Code starts, inside the sandbox …</text>
+
+  <!-- Claude's text box -->
+  <rect x="20.5" y="256.5" width="959" height="38" rx="6" fill="none" stroke="#7f97a3"/>
+  <text x="36" y="281">&gt;</text>
+  <rect x="54" y="267" width="9" height="18" fill="#d9e7ed"/>
+
+  <!-- status line: tclaude-statusline -->
+  <rect x="20" y="306" width="164" height="22" fill="#005faf"/>
+  <text x="102" y="322" text-anchor="middle" class="bold" style="fill:#ffffff">tclaude sandbox</text>
+  <text x="196" y="322">writes only: ~/my-project, ~/tmp, /beegfs/CMIP6/user/my-project-data</text>
+
+  <!-- tmux status bar -->
+  <path d="M0 344 H1000 V362 A10 10 0 0 1 990 372 H10 A10 10 0 0 1 0 362 Z" fill="#303030"/>
+  <text x="8" y="363" style="fill:#bcbcbc">[tclaude_my-project]</text>
+  <rect x="212" y="344" width="112" height="28" fill="#005faf"/>
+  <text x="268" y="363" text-anchor="middle" class="bold" style="fill:#ffffff">0:tclaude*</text>
+  <rect x="332" y="344" width="200" height="28" fill="#ffaf00"/>
+  <text x="432" y="363" text-anchor="middle" style="fill:#000000">1:chinook_terminal-</text>
+  <text x="990" y="363" text-anchor="end" style="fill:#bcbcbc">"chinook04"</text>
+</svg>
